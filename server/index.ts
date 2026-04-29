@@ -13,6 +13,32 @@ declare module "http" {
   }
 }
 
+const ALLOWED_ORIGINS = [
+  /^https:\/\/.*\.pages\.dev$/,
+  /^https:\/\/aibay\.pages\.dev$/,
+  /^https:\/\/.*\.cloudflareaccess\.com$/,
+  /^https:\/\/.*\.onrender\.com$/,
+  /^http:\/\/localhost(:\d+)?$/,
+  /^https?:\/\/.*\.repl(it)?\.co$/,
+  /^https?:\/\/.*\.replit\.dev$/,
+];
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin || "";
+  const allowed =
+    ALLOWED_ORIGINS.some((re) => re.test(origin)) ||
+    process.env.CORS_ORIGIN === "*" ||
+    (process.env.CORS_ORIGIN && origin === process.env.CORS_ORIGIN);
+  if (allowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(
   express.json({
     verify: (req, _res, buf) => {

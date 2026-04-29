@@ -1,30 +1,28 @@
 services:
-    - type: web
-      name: aibay
-      runtime: node
-      plan: free
-      buildCommand: npm install --ignore-scripts && npm run build
-      startCommand: node dist/index.cjs
-      envVars:
-        - key: NODE_ENV
-          value: production
-        - key: SESSION_SECRET
-          generateValue: true
-        - key: DATABASE_URL
-          fromDatabase:
-            name: aibay-db
-            property: connectionString
-        - key: EBAY_APP_ID
-          sync: false
-        - key: CORS_ORIGIN
-          value: https://aibay-1ti.pages.dev
-        - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
-          value: "1"
-      healthCheckPath: /api/health
+  - type: web
+    name: aibay
+    runtime: node
+    plan: free
+    branch: render-deploy
+    buildCommand: ""
+    startCommand: node dist/index.cjs
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: aibay-db
+          property: connectionString
+      - key: EBAY_APP_ID
+        sync: false
+      - key: CORS_ORIGIN
+        value: https://georgelsmith333-hub.github.io
 
-  databases:
-    - name: aibay-db
-      plan: free
-      databaseName: aibay
-      user: aibay
-  
+databases:
+  - name: aibay-db
+    plan: free
+    databaseName: aibay
+    user: aibay

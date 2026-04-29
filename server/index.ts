@@ -18,6 +18,7 @@ const ALLOWED_ORIGINS = [
   /^https:\/\/aibay\.pages\.dev$/,
   /^https:\/\/.*\.cloudflareaccess\.com$/,
   /^https:\/\/.*\.onrender\.com$/,
+  /^https:\/\/.*\.github\.io$/,
   /^http:\/\/localhost(:\d+)?$/,
   /^https?:\/\/.*\.repl(it)?\.co$/,
   /^https?:\/\/.*\.replit\.dev$/,

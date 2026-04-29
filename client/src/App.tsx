@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Switch, Route } from "wouter";
+import { Switch, Route, Router as WouterRouter } from "wouter";
 import { queryClient } from "./lib/queryClient";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
@@ -20,6 +20,9 @@ import ProfitCalculatorPage from "@/pages/profit-calculator";
 import SupplierIntelligencePage from "@/pages/supplier-intelligence";
 import CalculatorPage from "@/pages/calculator";
 import TemplatesPage from "@/pages/templates";
+import VeroCheckerPage from "@/pages/vero-checker";
+import RoasCalculatorPage from "@/pages/roas-calculator";
+import AdSpyPage from "@/pages/ad-spy";
 import NotFound from "@/pages/not-found";
 
 function ThemeInit() {
@@ -51,10 +54,15 @@ function Router() {
       <Route path="/supplier" component={SupplierIntelligencePage} />
       <Route path="/calculator" component={CalculatorPage} />
       <Route path="/templates" component={TemplatesPage} />
+      <Route path="/vero-checker" component={VeroCheckerPage} />
+      <Route path="/roas-calculator" component={RoasCalculatorPage} />
+      <Route path="/ad-spy" component={AdSpyPage} />
       <Route component={NotFound} />
     </Switch>
   );
 }
+
+const BASE_PATH = import.meta.env.VITE_BASE_PATH?.replace(/\/$/, '') || '';
 
 function App() {
   return (
@@ -62,7 +70,9 @@ function App() {
       <TooltipProvider>
         <ThemeInit />
         <Toaster />
-        <Router />
+        <WouterRouter base={BASE_PATH}>
+          <Router />
+        </WouterRouter>
       </TooltipProvider>
     </QueryClientProvider>
   );

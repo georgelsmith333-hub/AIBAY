@@ -17,10 +17,14 @@ export default defineConfig(async () => {
     plugins.push(runtimeErrorOverlay(), cartographerMod.cartographer(), devBannerMod.devBanner());
   }
 
+  const base = process.env.VITE_BASE_PATH || '/';
+
   return {
     plugins,
+    base,
     define: {
       'import.meta.env.VITE_API_URL': JSON.stringify(process.env.VITE_API_URL || ''),
+      'import.meta.env.VITE_BASE_PATH': JSON.stringify(base),
     },
     resolve: {
       alias: {

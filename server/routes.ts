@@ -3,8 +3,11 @@ import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { api } from "@shared/routes";
 import { scrapeProduct } from "./services/scraper";
-import { generateListingContent } from "./services/aiRouter";
+import {
+  generateListingContent, calculateROAS, analyzeExistingListing, generateBulkListings,
+} from "./services/aiRouter";
 import { runArena, runFullAuto, scoreFullListing, MODEL_REGISTRY } from "./services/modelArena";
+import { checkVero, checkVeroBatch } from "./services/veroChecker";
 import { processImages } from "./services/imageProcessor";
 import {
   getMarketAnalysis,
@@ -34,7 +37,7 @@ import {
   suggestMinSalePrice,
 } from "./services/aiRouter";
 import { isReplicateConfigured, upscaleImage, upscaleImageStrict, removeBackground, generateLifestyleImage, ReplicateApiError } from "./services/replicateService";
-import { scrapeProductFromUrl, detectPlatform, validateSafeUrl } from "./services/platformScrapers";
+import { scrapeProductFromUrl, detectPlatform, validateSafeUrl, type ScrapedProduct } from "./services/platformScrapers";
 import { searchSuppliers, buildSearchUrls } from "./services/supplierFinder";
 import { z } from "zod";
 import archiver from "archiver";
@@ -160,17 +163,25 @@ export async function registerRoutes(
 
   // ─── Trending Items ──────────────────────────────────────────────────────────
   app.get("/api/ebay/trending", async (req, res) => {
+    const categoryId = req.query.categoryId ? String(req.query.categoryId) : undefined;
+    const marketplace = String(req.query.marketplace || "EBAY-US");
+    const sortMode = String(req.query.sortMode || "watchCount");
+    const timeRange = String(req.query.timeRange || "all");
     try {
-      const categoryId = req.query.categoryId ? String(req.query.categoryId) : undefined;
-      const marketplace = String(req.query.marketplace || "EBAY-US");
-      const sortMode = String(req.query.sortMode || "watchCount");
-      const timeRange = String(req.query.timeRange || "all");
-
       const items = await getTrendingItems(categoryId, marketplace, sortMode, timeRange);
-      res.json({ items });
+      res.json({ items, source: "live" });
     } catch (error) {
-      console.error("Trending error:", error);
-      res.status(500).json({ message: error instanceof Error ? error.message : "Error" });
+      // Never crash — return structured demo data so frontend always renders
+      console.warn("Trending live fetch failed, returning demo data:", error instanceof Error ? error.message : String(error));
+      const { generateDemoSearchResult } = await import("./services/ebayApi");
+      const demo = generateDemoSearchResult("trending electronics", false, 30, categoryId);
+      const demoItems = demo.items.map((it, i) => ({
+        ...it,
+        trendDirection: (["up", "up", "neutral", "down"] as const)[i % 4],
+        trendScore: Math.max(15, 95 - i * 2),
+        isDemo: true,
+      }));
+      res.json({ items: demoItems, source: "demo", message: "Using sample data — live eBay API unavailable" });
     }
   });
 
@@ -210,7 +221,7 @@ export async function registerRoutes(
         price: i.price,
         watchCount: i.watchCount,
       }));
-      const { verdicts } = await generateScanVerdicts(verdictInput).catch(() => ({ verdicts: [] as any[] }));
+      const verdicts = await generateScanVerdicts(verdictInput).catch(() => ({} as Record<string, string>));
 
       const itemsWithVerdicts = result.items.map((item, idx) => ({
         ...item,
@@ -292,17 +303,18 @@ export async function registerRoutes(
       const aiKeywords = await generateKeywordSuggestions(keyword);
 
       // Get competition data for each keyword (top 5 only to avoid rate limits)
+      // aiKeywords.keywords is string[] — each kw is a plain string
       const competitionData = await Promise.allSettled(
-        aiKeywords.keywords.slice(0, 5).map((kw: any) =>
-          getKeywordCompetition(kw.keyword, marketplace)
+        aiKeywords.keywords.slice(0, 5).map((kw: string) =>
+          getKeywordCompetition(kw, marketplace)
         )
       );
 
-      const enriched = aiKeywords.keywords.map((kw: any, idx: number) => ({
-        ...kw,
+      const enriched = aiKeywords.keywords.map((kw: string, idx: number) => ({
+        keyword: kw,
         competition:
           competitionData[idx]?.status === "fulfilled"
-            ? competitionData[idx].value
+            ? (competitionData[idx] as PromiseFulfilledResult<unknown>).value
             : { activeCount: 0, soldCount: 0, avgPrice: 0 },
       }));
 
@@ -482,7 +494,7 @@ export async function registerRoutes(
         categoryBreadcrumb: category || undefined,
       };
 
-      const aiContent = await generateListingContent(scrapedData as any, titleOverride || undefined);
+      const aiContent = await generateListingContent(scrapedData, titleOverride || undefined);
       const rawImages = imageUrls.length > 0 ? await processImages(imageUrls) : [];
 
       const [titleScoreResult, categoriesResult, lifestylePrompts] = await Promise.all([
@@ -506,7 +518,7 @@ export async function registerRoutes(
         generatedTitle: aiContent.title,
         generatedHtml: aiContent.html_description,
         images: finalImageUrls,
-        rawData: scrapedData as any,
+        rawData: scrapedData,
         itemSpecifics: itemSpecificsFixed,
         suggestedCategories: categoriesResult,
         titleScore: titleScoreResult,
@@ -1266,7 +1278,7 @@ export async function registerRoutes(
 
       try {
         const analysis = await getMarketAnalysis(keyword, { marketplace: item.marketplace || "EBAY-US" });
-        if (analysis?.avgPrice) currentAvgPrice = String(analysis.avgPrice.toFixed(2));
+        if (analysis?.avgActivePrice) currentAvgPrice = String(analysis.avgActivePrice.toFixed(2));
         if (analysis?.sellThroughRate) sellThroughRate = String(analysis.sellThroughRate.toFixed(2));
       } catch {}
 
@@ -1291,7 +1303,7 @@ export async function registerRoutes(
           try {
             const analysis = await getMarketAnalysis(keyword, { marketplace: item.marketplace || "EBAY-US" });
             return storage.updateWatchlistItem(item.id, {
-              currentAvgPrice: analysis?.avgPrice ? String(analysis.avgPrice.toFixed(2)) : undefined,
+              currentAvgPrice: analysis?.avgActivePrice ? String(analysis.avgActivePrice.toFixed(2)) : undefined,
               sellThroughRate: analysis?.sellThroughRate ? String(analysis.sellThroughRate.toFixed(2)) : undefined,
               lastCheckedAt: new Date(),
             });
@@ -1420,7 +1432,7 @@ export async function registerRoutes(
 
       const winner = await runFullAuto(resolvedProductData);
       if (!winner) {
-        return res.status(500).json({ message: "All models failed — check OPENROUTER_API_KEY" });
+        return res.status(500).json({ message: "All AI models failed — please try again" });
       }
 
       // Save as a listing
@@ -1437,6 +1449,114 @@ export async function registerRoutes(
       console.error("Arena auto error:", error);
       res.status(500).json({ message: error instanceof Error ? error.message : "Error" });
     }
+  });
+
+  // ─── VERO Brand Checker ────────────────────────────────────────────────────
+
+  app.post("/api/vero/check", (req, res) => {
+    try {
+      const { text } = req.body;
+      if (!text || typeof text !== "string") {
+        return res.status(400).json({ message: "text required" });
+      }
+      const result = checkVero(text);
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ message: "VERO check failed" });
+    }
+  });
+
+  app.post("/api/vero/batch", (req, res) => {
+    try {
+      const { titles } = req.body;
+      if (!Array.isArray(titles)) {
+        return res.status(400).json({ message: "titles array required" });
+      }
+      const results = checkVeroBatch(titles.slice(0, 50));
+      res.json({ results });
+    } catch (error) {
+      res.status(500).json({ message: "VERO batch check failed" });
+    }
+  });
+
+  // ─── ROAS Calculator ──────────────────────────────────────────────────────
+
+  app.post("/api/tools/roas", async (req, res) => {
+    try {
+      const { adSpend, revenue, cogs, ebayFeePercent, shippingCost } = req.body;
+      if (typeof revenue !== "number" || typeof cogs !== "number") {
+        return res.status(400).json({ message: "revenue and cogs are required numbers" });
+      }
+      const result = await calculateROAS({ adSpend: adSpend || 0, revenue, cogs, ebayFeePercent, shippingCost });
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ message: "ROAS calculation failed" });
+    }
+  });
+
+  // ─── Bulk Listing Generator ────────────────────────────────────────────────
+
+  app.post("/api/listings/bulk", async (req, res) => {
+    try {
+      const { products } = req.body;
+      if (!Array.isArray(products) || products.length === 0) {
+        return res.status(400).json({ message: "products array required" });
+      }
+      const results = await generateBulkListings(products.slice(0, 20));
+      res.json({ results, count: results.length });
+    } catch (error) {
+      console.error("Bulk generate error:", error);
+      res.status(500).json({ message: error instanceof Error ? error.message : "Bulk generation failed" });
+    }
+  });
+
+  // ─── Listing Analyzer ─────────────────────────────────────────────────────
+
+  app.post("/api/listings/analyze-url", async (req, res) => {
+    try {
+      const { url, title, description } = req.body;
+      if (!url && !title) {
+        return res.status(400).json({ message: "url or title required" });
+      }
+      // If we have a real URL, try to scrape it for analysis
+      let analysisTarget = url || title;
+      let scrapedData: ScrapedProduct | null = null;
+      if (url) {
+        try {
+          scrapedData = await scrapeProduct(url);
+        } catch {
+          // URL scrape failed, analyze from URL string
+        }
+      }
+      const titleToAnalyze = scrapedData?.title || title || url;
+      const veroResult = checkVero(titleToAnalyze);
+      const aiAnalysis = await analyzeExistingListing(analysisTarget);
+
+      // Score the scraped listing if we have content
+      let optimizationScore = null;
+      if (scrapedData) {
+        optimizationScore = scoreFullListing({
+          title: scrapedData.title || "",
+          htmlDescription: scrapedData.description || "",
+          imageCount: scrapedData.images?.length || 0,
+        });
+      }
+      res.json({ ...aiAnalysis, veroRisk: veroResult, optimizationScore, scrapedData });
+    } catch (error) {
+      console.error("Listing analyze error:", error);
+      res.status(500).json({ message: error instanceof Error ? error.message : "Analysis failed" });
+    }
+  });
+
+  // ─── AI Models Info ───────────────────────────────────────────────────────
+
+  app.get("/api/ai/models", (_req, res) => {
+    res.json({ models: MODEL_REGISTRY, provider: "Pollinations.AI", free: true, requiresKey: false });
+  });
+
+  // ─── Health Check (required by Render for deployment health) ─────────────
+  app.get("/api/health", (_req, res) => {
+    res.json({ status: "ok", ts: Date.now(), version: "2.0.0" });
   });
 
   return httpServer;

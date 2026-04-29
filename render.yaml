@@ -4,7 +4,7 @@ services:
     runtime: node
     plan: free
     buildCommand: npm install && npm run build
-    startCommand: node dist/index.js
+    startCommand: node dist/index.cjs
     envVars:
       - key: NODE_ENV
         value: production
@@ -14,12 +14,10 @@ services:
         fromDatabase:
           name: aibay-db
           property: connectionString
-      - key: OPENROUTER_API_KEY
-        sync: false
       - key: EBAY_APP_ID
         sync: false
-      - key: REPLICATE_API_TOKEN
-        sync: false
+      - key: CORS_ORIGIN
+        value: https://aibay.pages.dev
     healthCheckPath: /api/health
 
 databases:

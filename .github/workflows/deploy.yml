@@ -1,0 +1,72 @@
+name: Deploy AIBAY
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+          PLAYWRIGHT_BROWSERS_PATH: '0'
+        run: npm install
+
+      - name: Build frontend for GitHub Pages
+        env:
+          VITE_API_URL: https://aibay-zpsa.onrender.com
+          VITE_BASE_PATH: /AIBAY/
+          NODE_ENV: production
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: npx vite build
+
+      - name: Build backend
+        env:
+          NODE_ENV: production
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: npx tsx script/build.ts
+
+      - name: Create 404.html for SPA routing
+        run: |
+          cat > dist/public/404.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><meta charset="utf-8">
+          <script>
+            var l = window.location;
+            l.replace(l.protocol + '//' + l.hostname + (l.port ? ':' + l.port : '') +
+              l.pathname.split('/').slice(0, 2).join('/') + '/?/' +
+              l.pathname.slice(1).split('/').slice(1).join('/').replace(/&/g, '~and~') +
+              (l.search ? '&' + l.search.slice(1).replace(/&/g, '~and~') : '') + l.hash);
+          </script>
+          </head><body></body></html>
+          EOF
+
+      - name: Deploy frontend to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist/public
+          publish_branch: gh-pages
+
+      - name: Deploy backend to render-deploy branch
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git checkout --orphan render-deploy-temp
+          git rm -rf . --quiet
+          mkdir -p dist
+          cp dist/index.cjs dist/index.cjs 2>/dev/null || true
+          git add dist/index.cjs
+          git commit -m "deploy: backend build $(date -u +%Y%m%d%H%M%S)"
+          git push origin HEAD:render-deploy --force

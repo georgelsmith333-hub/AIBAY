@@ -212,7 +212,11 @@ export class DatabaseStorage implements IStorage {
 
   // ─── Profit Scenarios ───────────────────────────────────────────────────────
   async createProfitScenario(scenario: InsertProfitScenario): Promise<ProfitScenario> {
-    const [created] = await db.insert(profitScenarios).values(scenario).returning();
+    const [created] = await db.insert(profitScenarios).values({
+      ...scenario,
+      inputs: scenario.inputs ?? {},
+      outputs: scenario.outputs ?? {},
+    }).returning();
     return created;
   }
 
@@ -226,7 +230,10 @@ export class DatabaseStorage implements IStorage {
 
   // ─── Templates ──────────────────────────────────────────────────────────────
   async createTemplate(template: InsertTemplate): Promise<Template> {
-    const [created] = await db.insert(templates).values(template).returning();
+    const [created] = await db.insert(templates).values({
+      ...template,
+      blocks: template.blocks ?? [],
+    }).returning();
     return created;
   }
 

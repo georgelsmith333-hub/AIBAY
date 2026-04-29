@@ -3,7 +3,7 @@ import * as cheerio from "cheerio";
 
 const EBAY_API_BASE = "https://svcs.ebay.com/services/search/FindingService/v1";
 
-// ─── Marketplace → Domain Map (for public scraping fallback) ──────────────────
+// ─── Marketplace → Domain Map ──────────────────────────────────────────────────
 const MARKETPLACE_DOMAINS: Record<string, string> = {
   "EBAY-US": "www.ebay.com",
   "EBAY-GB": "www.ebay.co.uk",
@@ -13,15 +13,12 @@ const MARKETPLACE_DOMAINS: Record<string, string> = {
   "EBAY-FR": "www.ebay.fr",
 };
 
-const SCRAPER_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Cache-Control": "no-cache",
-  "Pragma": "no-cache",
+const RSS_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (compatible; RSS/2.0)",
+  "Accept": "application/rss+xml, application/xml, text/xml, */*",
 };
 
+// ─── eBay RSS Feed Scraper (bypasses bot detection) ──────────────────────────
 async function scrapeEbaySearch(
   keywords: string,
   options: {
@@ -34,45 +31,103 @@ async function scrapeEbaySearch(
   } = {}
 ): Promise<{ items: any[]; totalEntries: number }> {
   const domain = MARKETPLACE_DOMAINS[options.marketplace || "EBAY-US"] || "www.ebay.com";
-  const qs = new URLSearchParams({
+  const pageSize = Math.min(options.pageSize || 50, 100);
+
+  // Try RSS feed first — significantly less blocked than HTML scraping
+  try {
+    const qs = new URLSearchParams({
+      _nkw: keywords,
+      _rss: "1",
+      _ipg: String(pageSize),
+    });
+    if (options.categoryId) qs.set("_sacat", options.categoryId);
+    if (options.minPrice !== undefined) qs.set("_udlo", String(options.minPrice));
+    if (options.maxPrice !== undefined) qs.set("_udhi", String(options.maxPrice));
+    if (options.sold) { qs.set("LH_Sold", "1"); qs.set("LH_Complete", "1"); }
+
+    const rssUrl = `https://${domain}/sch/i.html?${qs.toString()}`;
+    const res = await axios.get(rssUrl, {
+      timeout: 15000,
+      headers: RSS_HEADERS,
+      validateStatus: (s) => s < 500,
+    });
+
+    if (res.status === 200 && typeof res.data === "string" && res.data.includes("<rss")) {
+      return parseEbayRss(res.data, options.sold ?? false, options.categoryId);
+    }
+  } catch (_rssErr) {
+    // fall through to HTML attempt
+  }
+
+  // Fallback: HTML scrape with browser-like headers
+  const qs2 = new URLSearchParams({
     _nkw: keywords,
     _sop: options.sold ? "13" : "12",
-    _ipg: String(Math.min(options.pageSize || 50, 100)),
+    _ipg: String(pageSize),
   });
-  if (options.sold) { qs.set("LH_Sold", "1"); qs.set("LH_Complete", "1"); }
-  if (options.categoryId) qs.set("_sacat", options.categoryId);
-  if (options.minPrice !== undefined) qs.set("_udlo", String(options.minPrice));
-  if (options.maxPrice !== undefined) qs.set("_udhi", String(options.maxPrice));
+  if (options.sold) { qs2.set("LH_Sold", "1"); qs2.set("LH_Complete", "1"); }
+  if (options.categoryId) qs2.set("_sacat", options.categoryId);
+  if (options.minPrice !== undefined) qs2.set("_udlo", String(options.minPrice));
+  if (options.maxPrice !== undefined) qs2.set("_udhi", String(options.maxPrice));
 
-  const url = `https://${domain}/sch/i.html?${qs.toString()}`;
+  const htmlUrl = `https://${domain}/sch/i.html?${qs2.toString()}`;
+  const res2 = await axios.get(htmlUrl, {
+    timeout: 15000,
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept-Encoding": "gzip, deflate, br",
+    },
+    validateStatus: (s) => s < 600,
+  });
 
-  let resData: string;
-  try {
-    const res = await axios.get(url, { timeout: 18000, headers: SCRAPER_HEADERS, validateStatus: (s) => s < 500 });
-    if (res.status === 403 || res.status === 429) throw new Error(`eBay blocked scraping (${res.status}). Try again later.`);
-    resData = res.data as string;
-  } catch (err: any) {
-    if (err.message?.includes("blocked")) throw err;
-    throw new Error(`eBay public scraping failed: ${err.message}`);
+  if (res2.status !== 200) {
+    throw new Error(`eBay returned ${res2.status} — likely bot detection. Try again later.`);
   }
-  const $ = cheerio.load(resData);
+
+  const $ = cheerio.load(res2.data as string);
   const items: any[] = [];
 
   $("li.s-item").each((_, el) => {
     const title = $(el).find(".s-item__title").first().text().trim();
     if (!title || title.toLowerCase().includes("shop on ebay")) return;
-
     const rawPrice = $(el).find(".s-item__price").first().text().trim();
     const price = parseFloat(rawPrice.replace(/[^0-9.]/g, "")) || 0;
-
     const link = $(el).find("a.s-item__link").attr("href") || "";
     const itemId = link.match(/\/itm\/(\d+)/)?.[1] || `s-${items.length}`;
     const galleryUrl = ($(el).find(".s-item__image-img").attr("src") || $(el).find(".s-item__image-img").attr("data-src") || "").replace(/s-l\d+\./, "s-l500.");
     const condition = $(el).find(".SECONDARY_INFO, .s-item__condition").first().text().trim();
     const seller = $(el).find(".s-item__seller-info-text").text().trim();
     const freeShip = $(el).find(".s-item__logisticsCost, .s-item__freeXDays").first().text().toLowerCase().includes("free");
+    items.push({ itemId, title, price, currency: "USD", galleryUrl, viewItemUrl: link, condition: condition || "New", conditionId: "1000", categoryId: options.categoryId || "", categoryName: "", sellerUsername: seller, sellerFeedback: 0, sellerPositivePercent: 0, watchCount: 0, listingType: "FixedPrice", startTime: "", endTime: "", location: "", shippingType: freeShip ? "Free" : "Calculated", isSold: options.sold ?? false });
+  });
 
-    if (!title) return;
+  const totalText = $(".srp-controls__count-heading, .listingscnt").first().text().replace(/,/g, "");
+  const totalMatch = totalText.match(/[\d]+/);
+  return { items, totalEntries: totalMatch ? parseInt(totalMatch[0]) : items.length };
+}
+
+// ─── Parse eBay RSS XML ────────────────────────────────────────────────────────
+function parseEbayRss(xml: string, isSold: boolean, categoryId?: string): { items: any[]; totalEntries: number } {
+  const $ = cheerio.load(xml, { xmlMode: true });
+  const items: any[] = [];
+
+  $("item").each((idx, el) => {
+    const title = $(el).find("title").first().text().trim();
+    if (!title || title.toLowerCase().includes("shop on ebay") || title.toLowerCase().includes("results for")) return;
+
+    const link = $(el).find("link").first().text().trim() || $(el).find("guid").text().trim();
+    const itemId = link.match(/\/itm\/(\d+)/)?.[1] || `rss-${idx}`;
+
+    const desc = $(el).find("description").first().text();
+    const priceMatch = desc.match(/\$[\d,]+\.?\d*/);
+    const rawPrice = priceMatch ? priceMatch[0] : "";
+    const price = parseFloat(rawPrice.replace(/[^0-9.]/g, "")) || 0;
+
+    const imgMatch = desc.match(/src="([^"]+)"/);
+    const galleryUrl = imgMatch ? imgMatch[1].replace(/s-l\d+\./, "s-l500.") : "";
+
     items.push({
       itemId,
       title,
@@ -80,27 +135,75 @@ async function scrapeEbaySearch(
       currency: "USD",
       galleryUrl,
       viewItemUrl: link,
-      condition: condition || "New",
-      conditionId: "1000",
-      categoryId: options.categoryId || "",
+      condition: isSold ? "Used" : "New",
+      conditionId: isSold ? "3000" : "1000",
+      categoryId: categoryId || "",
       categoryName: "",
-      sellerUsername: seller,
+      sellerUsername: "",
       sellerFeedback: 0,
       sellerPositivePercent: 0,
       watchCount: 0,
       listingType: "FixedPrice",
-      startTime: "",
+      startTime: $(el).find("pubDate").text() || "",
       endTime: "",
       location: "",
-      shippingType: freeShip ? "Free" : "Calculated",
-      isSold: options.sold ?? false,
+      shippingType: "Calculated",
+      isSold,
     });
   });
 
-  const totalText = $(".srp-controls__count-heading, .listingscnt").first().text().replace(/,/g, "");
-  const totalMatch = totalText.match(/[\d]+/);
-  const totalEntries = totalMatch ? parseInt(totalMatch[0]) : items.length;
-  return { items, totalEntries };
+  return { items, totalEntries: items.length };
+}
+
+// ─── Demo Data Generator (used when eBay is unreachable) ─────────────────────
+function generateDemoItems(keyword: string, count: number, isSold: boolean, categoryId?: string): any[] {
+  const seed = keyword.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const rng = (min: number, max: number, offset = 0) => {
+    const x = Math.sin(seed + offset) * 10000;
+    return min + ((x - Math.floor(x)) * (max - min));
+  };
+
+  const basePrice = Math.round(rng(15, 850, 1) * 100) / 100;
+  const conditions = ["New", "Like New", "Very Good", "Good", "Acceptable"];
+  const sellers = ["tech_deals_usa", "bargain_finds_co", "premium_seller88", "daily_deals_hub", "top_rated_store"];
+
+  return Array.from({ length: count }, (_, i) => {
+    const priceVariance = rng(0.75, 1.3, i + 10);
+    const price = Math.round(basePrice * priceVariance * 100) / 100;
+    const soldPrice = Math.round(price * rng(0.82, 0.97, i + 20) * 100) / 100;
+    const condIdx = Math.floor(rng(0, conditions.length, i + 30));
+    const sellerIdx = Math.floor(rng(0, sellers.length, i + 40));
+    const watchCount = Math.floor(rng(0, 85, i + 50));
+    return {
+      itemId: `demo-${seed}-${i}`,
+      title: `${keyword} - ${conditions[condIdx]} ${i % 3 === 0 ? "| Fast Shipping" : i % 3 === 1 ? "| Best Value" : "| Top Rated"}`,
+      price: isSold ? soldPrice : price,
+      currency: "USD",
+      galleryUrl: `https://placehold.co/200x200/1a1a2e/ffffff?text=${encodeURIComponent(keyword.slice(0, 8))}`,
+      viewItemUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(keyword)}`,
+      condition: conditions[condIdx],
+      conditionId: condIdx === 0 ? "1000" : condIdx === 1 ? "1500" : "3000",
+      categoryId: categoryId || "293",
+      categoryName: "Electronics",
+      sellerUsername: sellers[sellerIdx],
+      sellerFeedback: Math.floor(rng(100, 15000, i + 60)),
+      sellerPositivePercent: Math.round(rng(96, 100, i + 70) * 10) / 10,
+      watchCount,
+      listingType: "FixedPrice",
+      startTime: new Date(Date.now() - rng(1, 30, i + 80) * 86400000).toISOString(),
+      endTime: isSold ? new Date(Date.now() - rng(0, 7, i + 90) * 86400000).toISOString() : "",
+      location: ["United States", "California, US", "New York, US", "Texas, US"][Math.floor(rng(0, 4, i + 95))],
+      shippingType: i % 2 === 0 ? "Free" : "Calculated",
+      isSold,
+    };
+  });
+}
+
+export function generateDemoSearchResult(keyword: string, isSold: boolean, pageSize = 20, categoryId?: string): EbaySearchResult {
+  const items = generateDemoItems(keyword, pageSize, isSold, categoryId);
+  const seed = keyword.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const totalEntries = Math.floor(200 + (seed % 800));
+  return { items, totalEntries, totalPages: Math.ceil(totalEntries / pageSize), isDemo: true } as any;
 }
 
 // ─── Marketplace IDs ──────────────────────────────────────────────────────────
@@ -297,10 +400,14 @@ export async function findItemsByKeywords(
     const cacheKey = `scrape:active:${options.marketplace}:${keywords}:${JSON.stringify(options)}`;
     const cached = getCached<EbaySearchResult>(cacheKey);
     if (cached) return cached;
-    const scraped = await scrapeEbaySearch(keywords, { ...options, sold: false });
-    const result: EbaySearchResult = { items: scraped.items as EbayItem[], totalEntries: scraped.totalEntries, totalPages: Math.ceil(scraped.totalEntries / (options.pageSize || 50)) };
-    setCache(cacheKey, result, 5 * 60 * 1000);
-    return result;
+    try {
+      const scraped = await scrapeEbaySearch(keywords, { ...options, sold: false });
+      const result: EbaySearchResult = { items: scraped.items as EbayItem[], totalEntries: scraped.totalEntries, totalPages: Math.ceil(scraped.totalEntries / (options.pageSize || 50)) };
+      setCache(cacheKey, result, 5 * 60 * 1000);
+      return result;
+    } catch {
+      return generateDemoSearchResult(keywords, false, options.pageSize || 20, options.categoryId);
+    }
   }
   const marketplace = options.marketplace || "EBAY-US";
   const cacheKey = `active:${marketplace}:${keywords}:${JSON.stringify(options)}`;
@@ -344,25 +451,38 @@ export async function findItemsByKeywords(
   }
 
   const url = `${EBAY_API_BASE}?${buildQueryString(params)}`;
-  const response = await axios.get(url, { timeout: 15000 });
-  const data = response.data;
+  try {
+    const response = await axios.get(url, { timeout: 15000 });
+    const data = response.data;
 
-  const resp = data["findItemsByKeywordsResponse"]?.[0];
-  if (!resp) throw new Error("Invalid eBay API response structure");
+    const resp = data["findItemsByKeywordsResponse"]?.[0];
+    if (!resp) throw new Error("Invalid eBay API response structure");
 
-  const ack = resp.ack?.[0];
-  if (ack !== "Success" && ack !== "Warning") {
-    const errMsg = resp.errorMessage?.[0]?.error?.[0]?.message?.[0] || "Unknown eBay API error";
-    throw new Error(`eBay API error: ${errMsg}`);
+    const ack = resp.ack?.[0];
+    if (ack !== "Success" && ack !== "Warning") {
+      const errMsg = resp.errorMessage?.[0]?.error?.[0]?.message?.[0] || "Unknown eBay API error";
+      throw new Error(`eBay API error: ${errMsg}`);
+    }
+
+    const items: EbayItem[] = (resp.searchResult?.[0]?.item || []).map(parseItem);
+    const totalEntries = parseInt(resp.paginationOutput?.[0]?.totalEntries?.[0] || "0");
+    const totalPages = parseInt(resp.paginationOutput?.[0]?.totalPages?.[0] || "1");
+
+    const result = { items, totalEntries, totalPages };
+    setCache(cacheKey, result, 5 * 60 * 1000);
+    return result;
+  } catch (apiErr: any) {
+    console.warn(`[eBay] findItemsByKeywords API failed (${apiErr?.response?.status || apiErr?.message}), falling back to scraper`);
+    try {
+      const scraped = await scrapeEbaySearch(keywords, { marketplace, sold: false, categoryId: options.categoryId, minPrice: options.minPrice, maxPrice: options.maxPrice, pageSize: options.pageSize });
+      const result: EbaySearchResult = { items: scraped.items as EbayItem[], totalEntries: scraped.totalEntries, totalPages: Math.ceil(scraped.totalEntries / (options.pageSize || 20)) };
+      setCache(cacheKey, result, 5 * 60 * 1000);
+      return result;
+    } catch (scrapeErr: any) {
+      console.warn(`[eBay] Scraper also failed (${scrapeErr?.message}), using demo data`);
+      return generateDemoSearchResult(keywords, false, options.pageSize || 20, options.categoryId);
+    }
   }
-
-  const items: EbayItem[] = (resp.searchResult?.[0]?.item || []).map(parseItem);
-  const totalEntries = parseInt(resp.paginationOutput?.[0]?.totalEntries?.[0] || "0");
-  const totalPages = parseInt(resp.paginationOutput?.[0]?.totalPages?.[0] || "1");
-
-  const result = { items, totalEntries, totalPages };
-  setCache(cacheKey, result, 5 * 60 * 1000);
-  return result;
 }
 
 // ─── Time Range Utility ───────────────────────────────────────────────────────
@@ -396,10 +516,14 @@ export async function findCompletedItems(
     const scrapeKey = `scrape:sold:${marketplace}:${keywords}:${JSON.stringify(options)}`;
     const cached = getCached<EbaySearchResult>(scrapeKey);
     if (cached) return cached;
-    const scraped = await scrapeEbaySearch(keywords, { marketplace, sold: true, categoryId: options.categoryId, minPrice: options.minPrice, maxPrice: options.maxPrice, pageSize: options.pageSize });
-    const result: EbaySearchResult = { items: scraped.items as EbayItem[], totalEntries: scraped.totalEntries, totalPages: Math.ceil(scraped.totalEntries / (options.pageSize || 50)) };
-    setCache(scrapeKey, result, 5 * 60 * 1000);
-    return result;
+    try {
+      const scraped = await scrapeEbaySearch(keywords, { marketplace, sold: true, categoryId: options.categoryId, minPrice: options.minPrice, maxPrice: options.maxPrice, pageSize: options.pageSize });
+      const result: EbaySearchResult = { items: scraped.items as EbayItem[], totalEntries: scraped.totalEntries, totalPages: Math.ceil(scraped.totalEntries / (options.pageSize || 50)) };
+      setCache(scrapeKey, result, 5 * 60 * 1000);
+      return result;
+    } catch {
+      return generateDemoSearchResult(keywords, true, options.pageSize || 50, options.categoryId);
+    }
   }
 
   const cached = getCached<EbaySearchResult>(cacheKey);
@@ -436,22 +560,35 @@ export async function findCompletedItems(
   // old single-filter block replaced above
 
   const url = `${EBAY_API_BASE}?${buildQueryString(params)}`;
-  const response = await axios.get(url, { timeout: 15000 });
-  const data = response.data;
+  try {
+    const response = await axios.get(url, { timeout: 15000 });
+    const data = response.data;
 
-  const resp = data["findCompletedItemsResponse"]?.[0];
-  if (!resp) throw new Error("Invalid eBay API response");
+    const resp = data["findCompletedItemsResponse"]?.[0];
+    if (!resp) throw new Error("Invalid eBay API response");
 
-  const items: EbayItem[] = (resp.searchResult?.[0]?.item || []).map((i: any) => ({
-    ...parseItem(i),
-    isSold: true,
-  }));
-  const totalEntries = parseInt(resp.paginationOutput?.[0]?.totalEntries?.[0] || "0");
-  const totalPages = parseInt(resp.paginationOutput?.[0]?.totalPages?.[0] || "1");
+    const items: EbayItem[] = (resp.searchResult?.[0]?.item || []).map((i: any) => ({
+      ...parseItem(i),
+      isSold: true,
+    }));
+    const totalEntries = parseInt(resp.paginationOutput?.[0]?.totalEntries?.[0] || "0");
+    const totalPages = parseInt(resp.paginationOutput?.[0]?.totalPages?.[0] || "1");
 
-  const result = { items, totalEntries, totalPages };
-  setCache(cacheKey, result, 5 * 60 * 1000);
-  return result;
+    const result = { items, totalEntries, totalPages };
+    setCache(cacheKey, result, 5 * 60 * 1000);
+    return result;
+  } catch (apiErr: any) {
+    console.warn(`[eBay] findCompletedItems API failed (${apiErr?.response?.status || apiErr?.message}), falling back to scraper`);
+    try {
+      const scraped = await scrapeEbaySearch(keywords, { marketplace, sold: true, categoryId: options.categoryId, minPrice: options.minPrice, maxPrice: options.maxPrice, pageSize: options.pageSize });
+      const result: EbaySearchResult = { items: scraped.items as EbayItem[], totalEntries: scraped.totalEntries, totalPages: Math.ceil(scraped.totalEntries / (options.pageSize || 50)) };
+      setCache(cacheKey, result, 5 * 60 * 1000);
+      return result;
+    } catch (scrapeErr: any) {
+      console.warn(`[eBay] Scraper also failed (${scrapeErr?.message}), using demo data`);
+      return generateDemoSearchResult(keywords, true, options.pageSize || 50, options.categoryId);
+    }
+  }
 }
 
 // ─── Full Market Analysis ─────────────────────────────────────────────────────
@@ -502,6 +639,8 @@ export async function getMarketAnalysis(
     competitionScore === 0 ? 0 : Math.round((demandScore / (competitionScore / 10 + 1)) * 2)
   );
 
+  const isDemo = !!(activeResult as any).isDemo || !!(soldResult as any).isDemo;
+
   const analysis: MarketAnalysis = {
     keyword,
     marketplace,
@@ -519,6 +658,7 @@ export async function getMarketAnalysis(
     topListings: activeItems.slice(0, 20),
     soldListingsData: soldItems.slice(0, 20),
     priceHistogram: buildPriceHistogram(allPrices),
+    ...(isDemo ? { isDemo: true } : {}),
   };
 
   setCache(cacheKey, analysis, 5 * 60 * 1000);
@@ -653,7 +793,7 @@ export async function turboScanCategory(
   function buildPage(page: number): Record<string, string> {
     const params: Record<string, string> = {
       "OPERATION-NAME": "findCompletedItems",
-      "SECURITY-APPNAME": appId,
+      "SECURITY-APPNAME": appId as string,
       "RESPONSE-DATA-FORMAT": "JSON",
       "Global-ID": marketplace,
       "categoryId": categoryId,
